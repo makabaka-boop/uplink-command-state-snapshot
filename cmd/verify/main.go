@@ -6,7 +6,10 @@
 //  3. 逆序确认（旧令牌先、新令牌后），断言旧令牌 409 且不改变状态，
 //     新令牌置终态；重复确认得到 409；
 //  4. 重启 API 进程（同库重连），重启前后终态唯一且一致；
-//  5. 直接查询 PostgreSQL 作为带外证据：settlements 仅一行、状态唯一。
+//  5. 直接查询 PostgreSQL 作为带外证据：settlements 仅一行、状态唯一；
+//  6. 读一致性：领取/回执交错期间高频并发 GET，断言任何响应都不存在跨代租约
+//     或“待处理且已结算”的组合；失败传播期间下游不呈现虚假可执行状态；
+//  7. 实例时钟偏移：两台时钟分别偏移 ±1 小时的实例对同一凭证给出相同裁决。
 //
 // 退出码 0 表示全部通过；任何断言失败都会打印详细错误并以非零退出。
 package main
@@ -171,6 +174,16 @@ func (v *verifier) run(ctx context.Context) error {
 
 	// 前驱链：链式解锁、失败传播、阻断来源与旧指令兼容。
 	if err := v.checkPredecessorChains(ctx); err != nil {
+		return err
+	}
+
+	// 读一致性：领取/回执交错期间的并发查询不得出现跨代租约或“待处理且已结算”。
+	if err := v.checkReadConsistency(ctx); err != nil {
+		return err
+	}
+
+	// 实例时钟偏移：两台时钟分别偏移 ±1h 的实例对同一凭证必须给出相同裁决。
+	if err := v.checkClockSkewAcrossInstances(ctx); err != nil {
 		return err
 	}
 
@@ -583,43 +596,52 @@ func (v *verifier) assertDatabase(ctx context.Context, id int64) error {
 	return nil
 }
 
-// restartAPIAndRecheck 在验证容器内重启 API 进程（重新执行迁移+连接同一数据库），
-// 模拟服务重启后继续裁决。需要 API_BIN 指向同构二进制（Dockerfile 已内置）。
-func (v *verifier) restartAPIAndRecheck(ctx context.Context, cmdPath string) error {
+// spawnAPI 在验收容器内启动一个 API 进程（同一数据库，可注入额外环境变量），
+// 返回指向该实例的客户端与停止函数。用于模拟重启与多实例（含时钟偏移）。
+func (v *verifier) spawnAPI(ctx context.Context, port string, extraEnv ...string) (*verifier, func(), error) {
 	bin := os.Getenv("API_BIN")
 	if bin == "" {
 		bin = "/usr/local/bin/api"
 	}
 	if _, err := os.Stat(bin); err != nil {
-		return fail("API binary not found at %s (set API_BIN): %v", bin, err)
-	}
-
-	port := os.Getenv("RESTART_API_PORT")
-	if port == "" {
-		port = "18080"
+		return nil, nil, fail("API binary not found at %s (set API_BIN): %v", bin, err)
 	}
 	cmd := exec.Command(bin)
-	cmd.Env = append(os.Environ(),
-		"API_PORT="+port,
-	)
+	cmd.Env = append(os.Environ(), "API_PORT="+port)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start restarted api: %w", err)
+		return nil, nil, fmt.Errorf("start api on %s: %w", port, err)
 	}
-	defer func() {
+	stop := func() {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		_ = cmd.Wait()
-	}()
-
-	restarted := &verifier{
+	}
+	inst := &verifier{
 		baseURL: "http://127.0.0.1:" + port,
 		dbURL:   v.dbURL,
 		client:  &http.Client{Timeout: 10 * time.Second},
 	}
-	if err := restarted.waitForAPI(ctx); err != nil {
-		return fmt.Errorf("restarted api unhealthy: %w", err)
+	if err := inst.waitForAPI(ctx); err != nil {
+		stop()
+		return nil, nil, fmt.Errorf("api on %s unhealthy: %w", port, err)
 	}
+	return inst, stop, nil
+}
+
+// restartAPIAndRecheck 在验证容器内重启 API 进程（重新执行迁移+连接同一数据库），
+// 模拟服务重启后继续裁决。需要 API_BIN 指向同构二进制（Dockerfile 已内置）。
+func (v *verifier) restartAPIAndRecheck(ctx context.Context, cmdPath string) error {
+	port := os.Getenv("RESTART_API_PORT")
+	if port == "" {
+		port = "18080"
+	}
+	restarted, stop, err := v.spawnAPI(ctx, port)
+	if err != nil {
+		return err
+	}
+	defer stop()
 
 	st, raw := restarted.doJSON(ctx, http.MethodGet, cmdPath, nil)
 	if st != http.StatusOK {
@@ -649,5 +671,279 @@ func (v *verifier) restartAPIAndRecheck(ctx context.Context, cmdPath string) err
 	}
 	fmt.Printf("restart recheck on %s: unique terminal state failed/gen3 preserved\n",
 		restarted.baseURL)
+	return nil
+}
+
+// consistencyView 是 GET 响应中用于自洽性校验的字段子集。
+type consistencyView struct {
+	Status          string `json:"status"`
+	LeaseGeneration int64  `json:"lease_generation"`
+	Leases          []struct {
+		Generation int64 `json:"generation"`
+	} `json:"leases"`
+	Settlement *struct {
+		Generation int64  `json:"generation"`
+		Result     string `json:"result"`
+	} `json:"settlement"`
+}
+
+// assertConsistentView 校验单次 GET 响应内部自洽：
+//   - 租约历史与 lease_generation 同源（第 i 条租约代次为 i+1，条数等于当前代次），
+//     不允许“旧代次状态 + 新代次租约”的跨代视图；
+//   - pending 不得带结算；delivered/failed 必须带与当前代次一致的结算
+//     （不允许“待处理且已结算”及其反面）；
+//   - blocked 不得有租约或结算（失败阻断不伴随虚假的可执行状态）。
+func assertConsistentView(raw []byte) error {
+	var cv consistencyView
+	if err := json.Unmarshal(raw, &cv); err != nil {
+		return fmt.Errorf("decode view: %w", err)
+	}
+	if int64(len(cv.Leases)) != cv.LeaseGeneration {
+		return fail("cross-generation view: lease_generation=%d but %d lease rows: %s",
+			cv.LeaseGeneration, len(cv.Leases), raw)
+	}
+	for i, l := range cv.Leases {
+		if l.Generation != int64(i+1) {
+			return fail("non-contiguous lease history: leases[%d].generation=%d: %s",
+				i, l.Generation, raw)
+		}
+	}
+	switch cv.Status {
+	case "pending":
+		if cv.Settlement != nil {
+			return fail("pending command carries a settlement: %s", raw)
+		}
+	case "delivered", "failed":
+		if cv.Settlement == nil {
+			return fail("terminal %s without settlement: %s", cv.Status, raw)
+		}
+		if cv.Settlement.Generation != cv.LeaseGeneration || cv.Settlement.Result != cv.Status {
+			return fail("settlement/status mismatch: %s", raw)
+		}
+	case "blocked":
+		if cv.Settlement != nil || len(cv.Leases) != 0 {
+			return fail("blocked command carries settlement/leases: %s", raw)
+		}
+	default:
+		return fail("unknown status in view: %s", raw)
+	}
+	return nil
+}
+
+// checkReadConsistency 可控的领取/回执交错 + 高频并发查询：
+// 阶段一让一条指令经历 10 代短租约更替后 delivered 结算；
+// 阶段二在根 failed 传播期间查询整条前驱链。
+// 任何一次 GET 都必须返回内部自洽的视图——不存在跨代租约或
+// “待处理且已结算”的组合；传播结束后下游 blocked 状态与结算记录相符。
+func (v *verifier) checkReadConsistency(ctx context.Context) error {
+	// 阶段一：租约代次更替 + 成功回执交错。
+	created := v.createCommand(ctx, map[string]any{"consistency": "churn"}, nil)
+	churnPath := fmt.Sprintf("/commands/%d", created.ID)
+
+	stop := make(chan struct{})
+	violations := make(chan error, 1)
+	var readers sync.WaitGroup
+	reader := func(path string) {
+		defer readers.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			st, raw, err := v.doJSONErr(ctx, http.MethodGet, path, nil)
+			if err != nil {
+				select {
+				case violations <- fmt.Errorf("get %s: %w", path, err):
+				default:
+				}
+				return
+			}
+			if st != http.StatusOK {
+				select {
+				case violations <- fail("get %s during churn: status=%d body=%s", path, st, raw):
+				default:
+				}
+				return
+			}
+			if err := assertConsistentView(raw); err != nil {
+				select {
+				case violations <- err:
+				default:
+				}
+				return
+			}
+			// 微睡眠降压：仍保持高频交错，但避免读侧把写侧的领取/回执
+			// 饿死在连接池上（验收环境可能是低规格容器）。
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go reader(churnPath)
+	}
+
+	for i := 0; i < 10; i++ {
+		st, raw := v.doJSON(ctx, http.MethodPost, "/claims",
+			map[string]any{"lease_duration_ms": 100})
+		if st != http.StatusOK {
+			return fail("churn claim %d: status=%d body=%s", i, st, raw)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	// 最后一代用满 5000ms 租期：读侧压力下写路径可能排队，
+	// 留足余量避免“租约在回执前真实到期”的测试自身时序问题。
+	st, raw := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("final churn claim: status=%d body=%s", st, raw)
+	}
+	finalClaim := decode[claimOut](raw)
+	st, raw = v.doJSON(ctx, http.MethodPost, churnPath+"/ack",
+		map[string]any{"lease_token": finalClaim.LeaseToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("final churn ack: status=%d body=%s", st, raw)
+	}
+
+	// 阶段二：失败回执的阻断传播交错。
+	root := v.createCommand(ctx, map[string]any{"consistency": "chain-root"}, nil)
+	child := v.createCommand(ctx, map[string]any{"n": 1}, &root.ID)
+	grand := v.createCommand(ctx, map[string]any{"n": 2}, &child.ID)
+	chainPaths := []string{
+		fmt.Sprintf("/commands/%d", root.ID),
+		fmt.Sprintf("/commands/%d", child.ID),
+		fmt.Sprintf("/commands/%d", grand.ID),
+	}
+	for _, p := range chainPaths {
+		for i := 0; i < 2; i++ {
+			readers.Add(1)
+			go reader(p)
+		}
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("chain root claim: status=%d body=%s", st, raw)
+	}
+	rootClaim := decode[claimOut](raw)
+	if rootClaim.CommandID != root.ID {
+		return fail("chain root claim got %d want %d", rootClaim.CommandID, root.ID)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, chainPaths[0]+"/ack",
+		map[string]any{"lease_token": rootClaim.LeaseToken, "result": "failed"})
+	if st != http.StatusOK {
+		return fail("fail chain root: status=%d body=%s", st, raw)
+	}
+
+	close(stop)
+	readers.Wait()
+	select {
+	case err := <-violations:
+		return err
+	default:
+	}
+
+	// 阶段一终态：10 代更替 + 最后一代 = 11 代，delivered 结算与当前代次一致。
+	got := v.getCommand(ctx, created.ID)
+	if got.Status != "delivered" || got.LeaseGeneration != 11 || len(got.Leases) != 11 {
+		return fail("churn final state: status=%s gen=%d leases=%d",
+			got.Status, got.LeaseGeneration, len(got.Leases))
+	}
+	if got.Settlement == nil || got.Settlement["result"] != "delivered" ||
+		int(got.Settlement["generation"].(float64)) != 11 {
+		return fail("churn settlement inconsistent: %v", got.Settlement)
+	}
+
+	// 阶段二终态：失败后下游状态与结算记录相符。
+	gotRoot := v.getCommand(ctx, root.ID)
+	if gotRoot.Status != "failed" || gotRoot.Settlement == nil ||
+		gotRoot.Settlement["result"] != "failed" ||
+		int(gotRoot.Settlement["generation"].(float64)) != int(gotRoot.LeaseGeneration) {
+		return fail("root after propagation inconsistent: %+v", gotRoot)
+	}
+	for _, id := range []int64{child.ID, grand.ID} {
+		d := v.getCommand(ctx, id)
+		if d.Status != "blocked" || d.BlockedBy == nil || *d.BlockedBy != root.ID {
+			return fail("node %d: status=%s blocked_by=%v want blocked by %d",
+				id, d.Status, d.BlockedBy, root.ID)
+		}
+		if len(d.Leases) != 0 || d.Settlement != nil {
+			return fail("blocked node %d must have no leases/settlement: leases=%d settlement=%v",
+				id, len(d.Leases), d.Settlement)
+		}
+	}
+	if st, _ := v.doJSON(ctx, http.MethodPost, "/claims",
+		map[string]any{"lease_duration_ms": 100}); st != http.StatusNoContent {
+		return fail("after failure propagation nothing should be claimable, got %d", st)
+	}
+	fmt.Println("read consistency checks passed (no cross-generation or pending+settled views)")
+	return nil
+}
+
+// checkClockSkewAcrossInstances 启动两台 API 实例，实例本地时钟分别落后/超前 1 小时
+// （DEEPSPACE_CLOCK_OFFSET_MS 注入；裁决只依赖数据库时钟）：
+//   - 尚在有效期的凭证，在时钟超前的实例上也必须被接受；
+//   - 已过期的凭证，在时钟落后的实例（以及超前实例）上都必须被拒绝。
+func (v *verifier) checkClockSkewAcrossInstances(ctx context.Context) error {
+	lag, stopLag, err := v.spawnAPI(ctx, "18101", "DEEPSPACE_CLOCK_OFFSET_MS=-3600000")
+	if err != nil {
+		return err
+	}
+	defer stopLag()
+	lead, stopLead, err := v.spawnAPI(ctx, "18102", "DEEPSPACE_CLOCK_OFFSET_MS=3600000")
+	if err != nil {
+		return err
+	}
+	defer stopLead()
+
+	// 尚在有效期的凭证：立刻在时钟超前 1 小时的实例上确认，必须被接受。
+	c1 := lag.createCommand(ctx, map[string]any{"skew": "valid"}, nil)
+	st, raw := lag.doJSON(ctx, http.MethodPost, "/claims",
+		map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("skew valid claim: status=%d body=%s", st, raw)
+	}
+	validToken := decode[claimOut](raw).LeaseToken
+	st, raw = lead.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", c1.ID),
+		map[string]any{"lease_token": validToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("leading-clock instance rejected a valid lease: status=%d body=%s", st, raw)
+	}
+
+	// 已过期的凭证：等到真实到期后，在时钟落后 1 小时的实例上确认，必须被拒绝。
+	c2 := lead.createCommand(ctx, map[string]any{"skew": "expired"}, nil)
+	st, raw = lead.doJSON(ctx, http.MethodPost, "/claims",
+		map[string]any{"lease_duration_ms": 100})
+	if st != http.StatusOK {
+		return fail("skew expired claim: status=%d body=%s", st, raw)
+	}
+	expiredToken := decode[claimOut](raw).LeaseToken
+	time.Sleep(300 * time.Millisecond)
+	st, raw = lag.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", c2.ID),
+		map[string]any{"lease_token": expiredToken, "result": "delivered"})
+	if st != http.StatusConflict || decode[apiError](raw).Error.Code != "lease_expired" {
+		return fail("lagging-clock instance accepted an expired lease: status=%d body=%s", st, raw)
+	}
+	// 同一张过期凭证在超前实例上也必须被拒绝：两台实例结论一致。
+	st, raw = lead.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", c2.ID),
+		map[string]any{"lease_token": expiredToken, "result": "delivered"})
+	if st != http.StatusConflict || decode[apiError](raw).Error.Code != "lease_expired" {
+		return fail("leading-clock instance accepted an expired lease: status=%d body=%s", st, raw)
+	}
+
+	// 收尾：c2 仍 pending（过期令牌被拒），领取并送达，避免遗留可领取指令干扰后续场景。
+	st, raw = lag.doJSON(ctx, http.MethodPost, "/claims",
+		map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("cleanup claim: status=%d body=%s", st, raw)
+	}
+	cleanup := decode[claimOut](raw)
+	if cleanup.CommandID != c2.ID {
+		return fail("cleanup claim got command %d, want %d", cleanup.CommandID, c2.ID)
+	}
+	st, raw = lag.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", c2.ID),
+		map[string]any{"lease_token": cleanup.LeaseToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("cleanup ack: status=%d body=%s", st, raw)
+	}
+	fmt.Println("clock skew checks passed (±1h instance clocks, identical lease verdicts)")
 	return nil
 }

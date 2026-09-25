@@ -2,8 +2,9 @@
 //
 // 配置（环境变量）：
 //
-//	API_PORT       监听端口，默认 8080（Docker Compose 通过它发布端口）
-//	DATABASE_URL   PostgreSQL 连接串，默认指向 compose 中的 db
+//	API_PORT                       监听端口，默认 8080（Docker Compose 通过它发布端口）
+//	DATABASE_URL                   PostgreSQL 连接串，默认指向 compose 中的 db
+//	DEEPSPACE_CLOCK_OFFSET_MS      （仅验收）实例本地时钟偏移毫秒数；缺省为正常行为
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -52,6 +54,19 @@ func main() {
 	logger.Info("migrations applied")
 
 	st := store.New(pool)
+	// DEEPSPACE_CLOCK_OFFSET_MS（仅验收使用，缺省即正常生产行为）：为实例本地时钟
+	// 注入固定偏移，供验收启动两台时钟分别偏移的实例，验证租约裁决不依赖实例时钟
+	// （裁决以数据库时钟为准）。该偏移不影响任何裁决结论。
+	if skewMS := os.Getenv("DEEPSPACE_CLOCK_OFFSET_MS"); skewMS != "" {
+		ms, err := strconv.Atoi(skewMS)
+		if err != nil {
+			logger.Error("invalid DEEPSPACE_CLOCK_OFFSET_MS", "value", skewMS)
+			os.Exit(1)
+		}
+		offset := time.Duration(ms) * time.Millisecond
+		st = store.NewWithClock(pool, func() time.Time { return time.Now().Add(offset) })
+		logger.Info("instance clock offset injected for acceptance", "offset_ms", ms)
+	}
 	srv := httpapi.New(st, logger)
 
 	httpServer := &http.Server{
