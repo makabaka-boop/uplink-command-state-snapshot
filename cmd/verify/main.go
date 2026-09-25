@@ -6,7 +6,11 @@
 //  3. 逆序确认（旧令牌先、新令牌后），断言旧令牌 409 且不改变状态，
 //     新令牌置终态；重复确认得到 409；
 //  4. 重启 API 进程（同库重连），重启前后终态唯一且一致；
-//  5. 直接查询 PostgreSQL 作为带外证据：settlements 仅一行、状态唯一。
+//     并在主/重启两个实例间核对领取过期边界结论一致（数据库时钟裁决）；
+//  5. 直接查询 PostgreSQL 作为带外证据：settlements 仅一行、状态唯一；
+//  6. 可控的领取/回执交错压力下，控制台详情页永不出现跨代租约或
+//     “待处理且已结算”的矛盾组合；
+//  7. 失败回执后，下游阻断状态与结算记录相符（无虚假可执行状态）。
 //
 // 退出码 0 表示全部通过；任何断言失败都会打印详细错误并以非零退出。
 package main
@@ -349,8 +353,19 @@ func (v *verifier) run(ctx context.Context) error {
 		return err
 	}
 
-	// 场景三：重启 API 进程，重启后终态唯一且一致。
+	// 场景三：重启 API 进程，重启后终态唯一且一致；并核对跨实例过期边界。
 	if err := v.restartAPIAndRecheck(ctx, cmdPath); err != nil {
+		return err
+	}
+
+	// 场景四：领取/回执交错压力下，控制台读取永远自洽
+	// （不出现跨代租约，也不出现“待处理且已结算”）。
+	if err := v.checkReadConsistencyUnderChurn(ctx); err != nil {
+		return err
+	}
+
+	// 场景五：失败回执后，下游阻断状态与结算记录相符。
+	if err := v.checkFailureConsistency(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -642,6 +657,56 @@ func (v *verifier) restartAPIAndRecheck(ctx context.Context, cmdPath string) err
 			return fail("after restart stale ack (%s): expected 409, got %d body=%s", tok, st, raw)
 		}
 	}
+
+	// 跨实例过期边界：主实例与重启实例共享同一数据库时钟裁决，结论必须一致。
+	// 有效凭证：主实例领取，重启实例接受。
+	x1 := v.createCommand(ctx, map[string]any{"skew": "valid"}, nil)
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 1500})
+	if st != http.StatusOK {
+		return fail("cross-instance claim x1: status=%d body=%s", st, raw)
+	}
+	cx1 := decode[claimOut](raw)
+	if cx1.CommandID != x1.ID {
+		return fail("cross-instance claim got %d want %d", cx1.CommandID, x1.ID)
+	}
+	st, raw = restarted.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", x1.ID),
+		map[string]any{"lease_token": cx1.LeaseToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("valid lease rejected by peer instance: status=%d body=%s", st, raw)
+	}
+
+	// 过期凭证：重启实例领取，主实例拒绝；随后主实例立即重领成功（同一边界），
+	// 新一代凭证在重启实例上完成回执。
+	x2 := v.createCommand(ctx, map[string]any{"skew": "expired"}, nil)
+	st, raw = restarted.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 100})
+	if st != http.StatusOK {
+		return fail("cross-instance claim x2: status=%d body=%s", st, raw)
+	}
+	cx2 := decode[claimOut](raw)
+	if cx2.CommandID != x2.ID {
+		return fail("cross-instance claim got %d want %d", cx2.CommandID, x2.ID)
+	}
+	time.Sleep(250 * time.Millisecond)
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", x2.ID),
+		map[string]any{"lease_token": cx2.LeaseToken, "result": "delivered"})
+	if st != http.StatusConflict || decode[apiError](raw).Error.Code != "lease_expired" {
+		return fail("expired lease on peer instance: want 409 lease_expired, got %d body=%s", st, raw)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 1500})
+	if st != http.StatusOK {
+		return fail("reclaim after peer rejected expired lease: status=%d body=%s", st, raw)
+	}
+	cx2new := decode[claimOut](raw)
+	if cx2new.CommandID != x2.ID || cx2new.Generation != cx2.Generation+1 {
+		return fail("reclaim must advance generation on the same command: %+v", cx2new)
+	}
+	st, raw = restarted.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", x2.ID),
+		map[string]any{"lease_token": cx2new.LeaseToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("reclaimed lease rejected by peer instance: status=%d body=%s", st, raw)
+	}
+	fmt.Println("cross-instance expiry boundary: both instances agree (database clock adjudicates)")
+
 	st, _ = restarted.doJSON(ctx, http.MethodPost, "/claims",
 		map[string]any{"lease_duration_ms": 100})
 	if st != http.StatusNoContent {
@@ -649,5 +714,252 @@ func (v *verifier) restartAPIAndRecheck(ctx context.Context, cmdPath string) err
 	}
 	fmt.Printf("restart recheck on %s: unique terminal state failed/gen3 preserved\n",
 		restarted.baseURL)
+	return nil
+}
+
+// detailPage 是控制台详情页的最小契约视图（GET /commands/{id}）。
+type detailPage struct {
+	Status          string `json:"status"`
+	LeaseGeneration int64  `json:"lease_generation"`
+	BlockedBy       *int64 `json:"blocked_by"`
+	Leases          []struct {
+		Generation int64 `json:"generation"`
+	} `json:"leases"`
+	Settlement *struct {
+		Generation int64  `json:"generation"`
+		Result     string `json:"result"`
+	} `json:"settlement"`
+}
+
+// pageInconsistency 校验单次详情页是否对应同一可解释快照：
+// 不出现跨代租约、不出现“待处理且已结算”、阻断不伴随虚假可执行状态。
+func pageInconsistency(p detailPage) error {
+	if int64(len(p.Leases)) != p.LeaseGeneration {
+		return fmt.Errorf("lease_generation=%d but %d lease rows (cross-generation view)",
+			p.LeaseGeneration, len(p.Leases))
+	}
+	for i, l := range p.Leases {
+		if l.Generation != int64(i+1) {
+			return fmt.Errorf("lease generations not contiguous from 1: leases[%d]=%d",
+				i, l.Generation)
+		}
+	}
+	switch p.Status {
+	case "pending":
+		if p.Settlement != nil {
+			return fmt.Errorf("pending page carries settlement %+v", p.Settlement)
+		}
+	case "delivered", "failed":
+		if p.Settlement == nil {
+			return fmt.Errorf("terminal status %q without settlement", p.Status)
+		}
+		if p.Settlement.Result != p.Status {
+			return fmt.Errorf("settlement result %q contradicts status %q",
+				p.Settlement.Result, p.Status)
+		}
+		if p.Settlement.Generation < 1 || p.Settlement.Generation > p.LeaseGeneration {
+			return fmt.Errorf("settlement generation %d outside 1..%d",
+				p.Settlement.Generation, p.LeaseGeneration)
+		}
+	case "blocked":
+		if p.BlockedBy == nil || len(p.Leases) != 0 || p.Settlement != nil || p.LeaseGeneration != 0 {
+			return fmt.Errorf("blocked page carries phantom executable/settled state: %+v", p)
+		}
+	default:
+		return fmt.Errorf("unknown status %q", p.Status)
+	}
+	return nil
+}
+
+// getPage 读取控制台详情页并断言 200。
+func (v *verifier) getPage(ctx context.Context, id int64) detailPage {
+	st, raw := v.doJSON(ctx, http.MethodGet, fmt.Sprintf("/commands/%d", id), nil)
+	if st != http.StatusOK {
+		fatal(fail("get page %d: status=%d body=%s", id, st, raw))
+	}
+	return decode[detailPage](raw)
+}
+
+// checkReadConsistencyUnderChurn 可控的领取/回执交错压力下，控制台（HTTP）
+// 高频读取的每一页都必须自洽：不出现跨代租约，也不出现“待处理且已结算”。
+func (v *verifier) checkReadConsistencyUnderChurn(ctx context.Context) error {
+	var mu sync.Mutex
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		c := v.createCommand(ctx, map[string]any{"churn": i}, nil)
+		ids = append(ids, c.ID)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+
+	// 终端侧：持续领取并回执——送达、失败、失联（租约到期后被重领、代次推进）
+	// 三种走向混合；队列排空时补充新指令维持压力。
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				st, raw := v.doJSON(ctx, http.MethodPost, "/claims",
+					map[string]any{"lease_duration_ms": 150})
+				if st == http.StatusNoContent {
+					mu.Lock()
+					canCreate := len(ids) < 48
+					mu.Unlock()
+					if canCreate {
+						s, r := v.doJSON(ctx, http.MethodPost, "/commands",
+							map[string]any{"payload": map[string]any{"churn": true}})
+						if s == http.StatusCreated {
+							c := decode[commandOut](r)
+							mu.Lock()
+							ids = append(ids, c.ID)
+							mu.Unlock()
+						}
+					}
+					continue
+				}
+				if st != http.StatusOK {
+					continue
+				}
+				cl := decode[claimOut](raw)
+				switch (w + i) % 3 {
+				case 0:
+					v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", cl.CommandID),
+						map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"})
+				case 1:
+					v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", cl.CommandID),
+						map[string]any{"lease_token": cl.LeaseToken, "result": "failed"})
+				default:
+					// 失联：不回执，等待租约到期后被其他终端重领。
+				}
+			}
+		}(w)
+	}
+
+	// 控制台侧：高频读取，任何矛盾页面立即上报。
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for n := 0; ; n++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				mu.Lock()
+				snapshot := append([]int64{}, ids...)
+				mu.Unlock()
+				if len(snapshot) == 0 {
+					continue
+				}
+				id := snapshot[(n+r)%len(snapshot)]
+				st, raw := v.doJSON(ctx, http.MethodGet, fmt.Sprintf("/commands/%d", id), nil)
+				if st != http.StatusOK {
+					continue
+				}
+				var p detailPage
+				if err := json.Unmarshal(raw, &p); err != nil {
+					select {
+					case errCh <- fmt.Errorf("command %d: undecodable page %s: %w", id, raw, err):
+					default:
+					}
+					return
+				}
+				if prob := pageInconsistency(p); prob != nil {
+					select {
+					case errCh <- fmt.Errorf("command %d: %v (page=%s)", id, prob, raw):
+					default:
+					}
+					return
+				}
+			}
+		}(r)
+	}
+
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+
+	// 排空：等失联租约到期后，把仍可领取的指令全部送达，
+	// 保持后续验收步骤“无可领取指令”的前提。
+	time.Sleep(300 * time.Millisecond)
+	for {
+		st, raw := v.doJSON(ctx, http.MethodPost, "/claims",
+			map[string]any{"lease_duration_ms": 500})
+		if st == http.StatusNoContent {
+			break
+		}
+		if st != http.StatusOK {
+			return fail("drain claim: status=%d body=%s", st, raw)
+		}
+		cl := decode[claimOut](raw)
+		st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", cl.CommandID),
+			map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"})
+		if st != http.StatusOK {
+			return fail("drain ack %d: status=%d body=%s", cl.CommandID, st, raw)
+		}
+	}
+	fmt.Println("read consistency under claim/ack churn: no contradictory console pages")
+	return nil
+}
+
+// checkFailureConsistency 失败回执导致的下游阻断必须与结算记录相符：
+// 失败根呈现 failed + failed 结算；下游呈现 blocked + 阻断来源，
+// 且无租约、无结算、不可领取（不伴随虚假的可执行状态）。
+func (v *verifier) checkFailureConsistency(ctx context.Context) error {
+	root := v.createCommand(ctx, map[string]any{"chain": "root"}, nil)
+	c1 := v.createCommand(ctx, map[string]any{"chain": 1}, &root.ID)
+	c2 := v.createCommand(ctx, map[string]any{"chain": 2}, &c1.ID)
+
+	st, raw := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 2000})
+	if st != http.StatusOK {
+		return fail("failure-consistency claim: status=%d body=%s", st, raw)
+	}
+	cl := decode[claimOut](raw)
+	if cl.CommandID != root.ID {
+		return fail("failure-consistency claim got %d want root %d", cl.CommandID, root.ID)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", root.ID),
+		map[string]any{"lease_token": cl.LeaseToken, "result": "failed"})
+	if st != http.StatusOK {
+		return fail("fail root: status=%d body=%s", st, raw)
+	}
+
+	// 失败根：状态与结算记录相符。
+	page := v.getPage(ctx, root.ID)
+	if page.Status != "failed" || page.Settlement == nil ||
+		page.Settlement.Result != "failed" || page.Settlement.Generation != cl.Generation {
+		return fail("failed root page contradicts settlement: %+v", page)
+	}
+	// 下游：阻断不伴随虚假可执行状态。
+	for _, id := range []int64{c1.ID, c2.ID} {
+		p := v.getPage(ctx, id)
+		if p.Status != "blocked" || p.BlockedBy == nil || *p.BlockedBy != root.ID {
+			return fail("descendant %d: status=%s blocked_by=%v want blocked by %d",
+				id, p.Status, p.BlockedBy, root.ID)
+		}
+		if prob := pageInconsistency(p); prob != nil {
+			return fail("descendant %d page inconsistent: %v", id, prob)
+		}
+	}
+	// 下游不可领取。
+	if st, _ := v.doJSON(ctx, http.MethodPost, "/claims",
+		map[string]any{"lease_duration_ms": 100}); st != http.StatusNoContent {
+		return fail("blocked downstream must not be claimable, got %d", st)
+	}
+	fmt.Println("failure consistency: downstream blocked pages match settlement records")
 	return nil
 }

@@ -42,14 +42,16 @@ var (
 )
 
 // Store 基于 pgxpool 的存储实现。
+//
+// 所有时间裁决（签发 expires_at、领取资格、回执时的过期判定）都以
+// 数据库时钟为唯一权威，不读取任何应用实例的本地时钟：多实例部署时
+// 各节点对同一张领取凭证得出相同结论，实例时钟偏差不参与裁决。
 type Store struct {
 	pool *pgxpool.Pool
-	// now 允许测试注入时钟；生产使用 time.Now。
-	now func() time.Time
 }
 
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool, now: time.Now}
+	return &Store{pool: pool}
 }
 
 // Ping 用于健康检查。
@@ -343,12 +345,14 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	}
 
 	// 令牌必须是系统签发过、且属于本指令的（其他指令的令牌视为从未签发）。
+	// 过期判定在 SQL 内以数据库时钟完成（expires_at > now()）：与领取资格
+	// 判定、expires_at 的签发同属一个时钟源，任何实例对同一令牌得出相同结论。
 	var leaseGen int64
-	var leaseExpires time.Time
+	var leaseLive bool
 	err = tx.QueryRow(ctx, `
-		SELECT generation, expires_at
+		SELECT generation, expires_at > now()
 		FROM leases
-		WHERE lease_token = $1 AND command_id = $2`, token, id).Scan(&leaseGen, &leaseExpires)
+		WHERE lease_token = $1 AND command_id = $2`, token, id).Scan(&leaseGen, &leaseLive)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrInvalidLeaseToken
 	}
@@ -359,7 +363,7 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	if leaseGen != currentGen {
 		return ErrLeaseStale
 	}
-	if !leaseExpires.After(s.now()) {
+	if !leaseLive {
 		return ErrLeaseStale
 	}
 
@@ -409,9 +413,23 @@ func scanArgs(c *Command) []any {
 }
 
 // GetCommand 返回指令详情（含领取代次历史与终态）。未知编号返回 ErrCommandNotFound。
+//
+// 指令本体、各代租约与结算记录在同一个只读 REPEATABLE READ 事务内读取，
+// 三者必然来自同一快照。控制台因此不会看到“旧领取代数配新代租约”的跨代
+// 页面，也不会看到“pending 状态配已生成结算”的矛盾页面；失败回执传播出的
+// blocked 状态要么整体可见、要么整体不可见，绝不呈现半完成的裁决。
 func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	d := &CommandDetail{}
-	err := scanCommand(s.pool.QueryRow(ctx, `
+	err = scanCommand(tx.QueryRow(ctx, `
 		SELECT `+commandColumns+`
 		FROM commands WHERE id = $1`, id), &d.Command)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -421,27 +439,28 @@ func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error
 		return nil, fmt.Errorf("get command: %w", err)
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT generation, expires_at, claimed_at
 		FROM leases WHERE command_id = $1
 		ORDER BY generation`, id)
 	if err != nil {
 		return nil, fmt.Errorf("get leases: %w", err)
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var lv LeaseView
 		if err := rows.Scan(&lv.Generation, &lv.ExpiresAt, &lv.ClaimedAt); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("scan lease: %w", err)
 		}
 		d.Leases = append(d.Leases, lv)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	var st Settlement
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT generation, result, settled_at
 		FROM settlements WHERE command_id = $1`, id).Scan(&st.Generation, &st.Result, &st.SettledAt)
 	switch {
@@ -450,6 +469,10 @@ func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error
 	case errors.Is(err, pgx.ErrNoRows):
 	default:
 		return nil, fmt.Errorf("get settlement: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("get commit: %w", err)
 	}
 	return d, nil
 }
