@@ -1,0 +1,21 @@
+# 编译产物
+/api
+/verify
+/bin/
+*.exe
+*.test
+*.out
+
+# 本地运行目录
+/tmp/
+*.log
+*.pid
+
+# Go
+/vendor/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
+*.swp

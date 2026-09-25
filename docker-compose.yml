@@ -1,0 +1,54 @@
+# 深空测控指令裁决服务运行时编排。
+#
+#   API_PORT       宿主机发布端口（默认 8080，映射到容器内 8080）
+#
+#   docker compose up --build         启动 API + PostgreSQL，并执行 verify 一次性验收
+#   docker compose run --rm verify    仅重跑验收（API/数据库已在运行时）
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: deepspace
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d deepspace"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    command: ["/app/api"]
+    environment:
+      API_PORT: "8080"
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/deepspace?sslmode=disable"
+    ports:
+      # 宿主机端口由 API_PORT 控制；容器内固定监听 8080。
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 一次性验收服务：跑完退出。它内部还会在同一容器内拉起第二个 API
+  # 进程（RESTART_API_PORT），模拟服务重启后对同一数据库继续裁决。
+  verify:
+    build: .
+    command: ["/app/verify"]
+    environment:
+      BASE_URL: "http://api:8080"
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/deepspace?sslmode=disable"
+      API_BIN: "/app/api"
+      RESTART_API_PORT: "18080"
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: "no"
+
+volumes:
+  db_data:
